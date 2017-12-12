@@ -30,6 +30,7 @@ import java.nio.channels.Selector;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
 
+import java.nio.channels.spi.SelectorProvider;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -124,6 +125,11 @@ public class TNonblockingServerSocket extends TNonblockingServerTransport {
     } catch (IOException iox) {
       throw new TTransportException(iox);
     }
+  }
+
+  @Override
+  public SelectorProvider selectorProvider() {
+    return SelectorProvider.provider();
   }
 
   public void registerSelector(Selector selector) {

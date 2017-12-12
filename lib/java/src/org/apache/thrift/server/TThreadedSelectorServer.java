@@ -30,7 +30,6 @@ import java.nio.channels.ClosedChannelException;
 import java.nio.channels.SelectableChannel;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
-import java.nio.channels.spi.SelectorProvider;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -358,7 +357,7 @@ public class TThreadedSelectorServer extends AbstractNonblockingServer {
         SelectorThreadLoadBalancer threadChooser) throws IOException {
       this.serverTransport = serverTransport;
       this.threadChooser = threadChooser;
-      this.acceptSelector = SelectorProvider.provider().openSelector();
+      this.acceptSelector = serverTransport.selectorProvider().openSelector();
       this.serverTransport.registerSelector(acceptSelector);
     }
 
@@ -514,6 +513,7 @@ public class TThreadedSelectorServer extends AbstractNonblockingServer {
      *           if a selector cannot be created.
      */
     public SelectorThread(BlockingQueue<TNonblockingTransport> acceptedQueue) throws IOException {
+      super(((TNonblockingServerTransport) serverTransport_).selectorProvider());
       this.acceptedQueue = acceptedQueue;
     }
 
@@ -639,7 +639,7 @@ public class TThreadedSelectorServer extends AbstractNonblockingServer {
       }
       Selector newSelector = null;
       try {
-        newSelector = Selector.open();
+        newSelector = oldSelector.provider().openSelector();
         LOGGER.warn("Created new Selector.");
       } catch (IOException e) {
         LOGGER.error("Create new Selector error.", e);

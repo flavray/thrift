@@ -157,8 +157,8 @@ public abstract class AbstractNonblockingServer extends TServer {
     // List of FrameBuffers that want to change their selection interests.
     protected final Set<FrameBuffer> selectInterestChanges = new HashSet<FrameBuffer>();
 
-    public AbstractSelectThread() throws IOException {
-      this.selector = SelectorProvider.provider().openSelector();
+    public AbstractSelectThread(SelectorProvider selectorProvider) throws IOException {
+      this.selector = selectorProvider.openSelector();
     }
 
     /**

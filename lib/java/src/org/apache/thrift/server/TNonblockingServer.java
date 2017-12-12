@@ -132,6 +132,7 @@ public class TNonblockingServer extends AbstractNonblockingServer {
      */
     public SelectAcceptThread(final TNonblockingServerTransport serverTransport)
     throws IOException {
+      super(serverTransport.selectorProvider());
       this.serverTransport = serverTransport;
       serverTransport.registerSelector(selector);
     }
