@@ -52,6 +52,9 @@ public abstract class AbstractNonblockingServer extends TServer {
   public static abstract class AbstractNonblockingServerArgs<T extends AbstractNonblockingServerArgs<T>> extends AbstractServerArgs<T> {
     public long maxReadBufferBytes = 256 * 1024 * 1024;
 
+    public int resizeIdleBufferEveryN = 512;
+    public int idleBufferBytes = 1024;
+
     public AbstractNonblockingServerArgs(TNonblockingServerTransport transport) {
       super(transport);
       transportFactory(new TFramedTransport.Factory());
@@ -66,6 +69,18 @@ public abstract class AbstractNonblockingServer extends TServer {
   final long MAX_READ_BUFFER_BYTES;
 
   /**
+   * TODO
+   */
+  final int RESIZE_IDLE_BUFFER_EVERY_N;
+
+  /**
+   * TODO
+   */
+  final int IDLE_BUFFER_BYTES;
+
+  protected static final ByteBuffer VOID_BUFFER = ByteBuffer.allocate(0);
+
+  /**
    * How many bytes are currently allocated to read buffers.
    */
   final AtomicLong readBufferBytesAllocated = new AtomicLong(0);
@@ -73,6 +88,8 @@ public abstract class AbstractNonblockingServer extends TServer {
   public AbstractNonblockingServer(AbstractNonblockingServerArgs args) {
     super(args);
     MAX_READ_BUFFER_BYTES = args.maxReadBufferBytes;
+    RESIZE_IDLE_BUFFER_EVERY_N = args.resizeIdleBufferEveryN;
+    IDLE_BUFFER_BYTES = args.idleBufferBytes;
   }
 
   /**
@@ -284,6 +301,13 @@ public abstract class AbstractNonblockingServer extends TServer {
     // the ByteBuffer we'll be using to write and read, depending on the state
     protected ByteBuffer buffer_;
 
+    protected ByteBuffer frameSizeBuffer_ = ByteBuffer.allocate(4);
+
+    protected ByteBuffer writeBuffer_ = VOID_BUFFER;
+
+    // TODO
+    protected long callsForResize = 0;
+
     protected final TByteArrayOutputStream response_;
 
     // the frame that the TTransport should wrap.
@@ -335,15 +359,15 @@ public abstract class AbstractNonblockingServer extends TServer {
     public boolean read() {
       if (state_ == FrameBufferState.READING_FRAME_SIZE) {
         // try to read the frame size completely
-        if (!internalRead()) {
+        if (!internalRead(frameSizeBuffer_)) {
           return false;
         }
 
         // if the frame size has been read completely, then prepare to read the
         // actual frame.
-        if (buffer_.remaining() == 0) {
+        if (frameSizeBuffer_.remaining() == 0) {
           // pull out the frame size as an integer.
-          int frameSize = buffer_.getInt(0);
+          int frameSize = frameSizeBuffer_.getInt(0);
           if (frameSize <= 0) {
             LOGGER.error("Read an invalid frame size of " + frameSize
                 + ". Are you using TFramedTransport on the client side?");
@@ -358,17 +382,25 @@ public abstract class AbstractNonblockingServer extends TServer {
             return false;
           }
 
-          // if this frame will push us over the memory limit, then return.
-          // with luck, more memory will free up the next time around.
-          if (readBufferBytesAllocated.get() + frameSize > MAX_READ_BUFFER_BYTES) {
-            return true;
+          // reallocate the readbuffer as a frame-sized buffer
+          int neededCapacity = 4 + frameSize;
+          if (neededCapacity > buffer_.capacity()) {
+            int extraCapacity = neededCapacity - buffer_.capacity();
+            // if this frame will push us over the memory limit, then return.
+            // with luck, more memory will free up the next time around.
+            if (readBufferBytesAllocated.get() + extraCapacity > MAX_READ_BUFFER_BYTES) {
+              return true;
+            }
+
+            // increment the amount of memory allocated to read buffers
+            readBufferBytesAllocated.addAndGet(extraCapacity);
+
+            buffer_ = ByteBuffer.allocate(neededCapacity);  // TODO: power of 2?
+          } else {
+            buffer_.limit(neededCapacity);
+            buffer_.rewind();
           }
 
-          // increment the amount of memory allocated to read buffers
-          readBufferBytesAllocated.addAndGet(frameSize + 4);
-
-          // reallocate the readbuffer as a frame-sized buffer
-          buffer_ = ByteBuffer.allocate(frameSize + 4);
           buffer_.putInt(frameSize);
 
           state_ = FrameBufferState.READING_FRAME;
@@ -411,7 +443,7 @@ public abstract class AbstractNonblockingServer extends TServer {
     public boolean write() {
       if (state_ == FrameBufferState.WRITING) {
         try {
-          if (trans_.write(buffer_) < 0) {
+          if (trans_.write(writeBuffer_) < 0) {
             return false;
           }
         } catch (IOException e) {
@@ -420,7 +452,7 @@ public abstract class AbstractNonblockingServer extends TServer {
         }
 
         // we're done writing. now we need to switch back to reading.
-        if (buffer_.remaining() == 0) {
+        if (writeBuffer_.remaining() == 0) {
           prepareRead();
         }
         return true;
@@ -485,14 +517,14 @@ public abstract class AbstractNonblockingServer extends TServer {
       // our read buffer count. we do this here as well as in close because
       // we'd like to free this read memory up as quickly as possible for other
       // clients.
-      readBufferBytesAllocated.addAndGet(-buffer_.array().length);
+      // readBufferBytesAllocated.addAndGet(-buffer_.array().length);  // TODO
 
       if (response_.len() == 0) {
         // go straight to reading again. this was probably an oneway method
         state_ = FrameBufferState.AWAITING_REGISTER_READ;
-        buffer_ = null;
+        // buffer_ = null;  // TODO
       } else {
-        buffer_ = ByteBuffer.wrap(response_.get(), 0, response_.len());
+        writeBuffer_ = ByteBuffer.wrap(response_.get(), 0, response_.len());
 
         // set state that we're waiting to be switched to write. we do this
         // asynchronously through requestSelectInterestChange() because there is
@@ -535,8 +567,18 @@ public abstract class AbstractNonblockingServer extends TServer {
      *         connection closed.
      */
     private boolean internalRead() {
+        return internalRead(buffer_);
+    }
+
+    /**
+     * Perform a read into any buffer.
+     *
+     * @return true if the read succeeded, false if there was an error or the
+     *         connection closed.
+     */
+    private boolean internalRead(ByteBuffer buffer) {
       try {
-        if (trans_.read(buffer_) < 0) {
+        if (trans_.read(buffer) < 0) {
           return false;
         }
         return true;
@@ -554,9 +596,24 @@ public abstract class AbstractNonblockingServer extends TServer {
       // we can set our interest directly without using the queue because
       // we're in the select thread.
       selectionKey_.interestOps(SelectionKey.OP_READ);
+      // buffer size housekeeping
+      if (++callsForResize >= RESIZE_IDLE_BUFFER_EVERY_N) {
+        callsForResize = 0;
+        resizeBuffer(IDLE_BUFFER_BYTES);
+      }
       // get ready for another go-around
-      buffer_ = ByteBuffer.allocate(4);
+      frameSizeBuffer_.rewind();
       state_ = FrameBufferState.READING_FRAME_SIZE;
+
+    }
+
+    protected void resizeBuffer(int bufferBytes) {
+      if ((bufferBytes > 0) && (buffer_.capacity() > bufferBytes)) {
+        readBufferBytesAllocated.addAndGet(-buffer_.array().length);
+        buffer_ = VOID_BUFFER;
+      } else {
+        buffer_.rewind();
+      }
     }
 
     /**
