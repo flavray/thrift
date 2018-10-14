@@ -1,7 +1,15 @@
 package org.apache.thrift.transport;
 
-import java.util.Arrays;
-
+/**
+ * TTransport backed by a growable byte array.
+ *
+ * This transport can be both read from and written into.
+ * NOTE: it is assumed that no interleaved read/write operations are performed.
+ * All read operation must happen before any write operation, and vice-versa.
+ *
+ * This can be useful for server implementation where a single "buffer' will be
+ * used to read and write data.
+ */
 public class TMemoryTransport extends TTransport {
 
   private enum State {
@@ -12,30 +20,13 @@ public class TMemoryTransport extends TTransport {
 
   private byte[] buf_;
   private int pos_;
-  private int endPos_;
-  private int resetPos_;
   private State state_ = State.INIT;
 
-  public TMemoryTransport() {
-  }
-
-  public TMemoryTransport(byte[] buf) {
-    reset(buf);
-  }
-
-  public TMemoryTransport(byte[] buf, int offset, int length) {
-    reset(buf, offset, length);
-  }
+  public TMemoryTransport() { }
 
   public void reset(byte[] buf) {
-    reset(buf, 0, buf.length);
-  }
-
-  public void reset(byte[] buf, int offset, int length) {
     buf_ = buf;
-    pos_ = offset;
-    endPos_ = offset + length;
-    resetPos_ = pos_;
+    pos_ = 0;
     state_ = State.INIT;
   }
 
@@ -57,7 +48,7 @@ public class TMemoryTransport extends TTransport {
   @Override
   public int read(byte[] buf, int off, int len) throws TTransportException {
     if (state_ != State.READING) {
-      pos_ = resetPos_;
+      pos_ = 0;
       state_ = State.READING;
     }
 
@@ -73,7 +64,7 @@ public class TMemoryTransport extends TTransport {
   @Override
   public void write(byte[] buf, int off, int len) throws TTransportException {
     if (state_ != State.WRITING) {
-      pos_ = resetPos_;
+      pos_ = 0;
       state_ = State.WRITING;
     }
 
@@ -87,14 +78,17 @@ public class TMemoryTransport extends TTransport {
     return buf_;
   }
 
+  @Override
   public int getBufferPosition() {
     return pos_;
   }
 
+  @Override
   public int getBytesRemainingInBuffer() {
-    return endPos_ - pos_;
+    return buf_.length - pos_;
   }
 
+  @Override
   public void consumeBuffer(int len) {
     pos_ += len;
   }
@@ -104,15 +98,15 @@ public class TMemoryTransport extends TTransport {
   }
 
   protected void ensureCapacity(int capacity) {
-    if (endPos_ - pos_ < capacity) {
+    if (pos_ + capacity > buf_.length) {
       grow(capacity);
     }
   }
 
   protected void grow(int capacity) {
     byte[] newBuf = new byte[capacity];
-    System.arraycopy(buf_, resetPos_, newBuf, 0, pos_- resetPos_);
-    reset(newBuf);
+    System.arraycopy(buf_, 0, newBuf, 0, pos_);
+    buf_ = newBuf;
   }
 
 }

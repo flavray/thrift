@@ -20,7 +20,6 @@
 package org.apache.thrift.server;
 
 import org.apache.thrift.TAsyncProcessor;
-import org.apache.thrift.TByteArrayOutputStream;
 import org.apache.thrift.TException;
 import org.apache.thrift.protocol.TProtocol;
 import org.apache.thrift.transport.*;
@@ -28,6 +27,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.nio.Buffer;
 import java.nio.ByteBuffer;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
@@ -63,15 +63,16 @@ public abstract class AbstractNonblockingServer extends TServer {
   final long MAX_READ_BUFFER_BYTES;
 
   /**
-   * TODO
+   * The number of calls before resizing oversized buffers (0 = only check on close)
    */
   final int RESIZE_IDLE_BUFFER_EVERY_N;
 
   /**
-   * TODO
+   * The maximum amount of allocated memory allowed for idle connections buffer.
    */
   final int IDLE_BUFFER_BYTES;
 
+  // Reusable empty ByteBuffer
   protected static final ByteBuffer VOID_BUFFER = ByteBuffer.allocate(0);
 
   /**
@@ -295,9 +296,10 @@ public abstract class AbstractNonblockingServer extends TServer {
     // the ByteBuffer we'll be using to write and read, depending on the state
     protected ByteBuffer buffer_;
 
-    protected ByteBuffer frameSizeBuffer_ = ByteBuffer.allocate(4);
+    // the ByteBuffer used to read frame sizes
+    protected ByteBuffer frameSizeBuffer_;
 
-    // TODO
+    // count the number of times the buffer has been used since its last resize check
     protected long callsForResize = 0;
 
     // the frame that the TTransport should wrap.
@@ -323,7 +325,8 @@ public abstract class AbstractNonblockingServer extends TServer {
       trans_ = trans;
       selectionKey_ = selectionKey;
       selectThread_ = selectThread;
-      buffer_ = ByteBuffer.allocate(4);
+      buffer_ = VOID_BUFFER;
+      frameSizeBuffer_ = ByteBuffer.allocate(4);
 
       frameTrans_ = new TMemoryTransport();
       inTrans_ = inputTransportFactory_.getTransport(frameTrans_);
@@ -384,7 +387,7 @@ public abstract class AbstractNonblockingServer extends TServer {
             // increment the amount of memory allocated to read buffers
             readBufferBytesAllocated.addAndGet(extraCapacity);
 
-            buffer_ = ByteBuffer.allocate(neededCapacity);  // TODO: power of 2?
+            buffer_ = ByteBuffer.allocate(neededCapacity);
           } else {
             buffer_.limit(neededCapacity);
             buffer_.rewind();
@@ -502,20 +505,14 @@ public abstract class AbstractNonblockingServer extends TServer {
      * to write and instead go back to reading.
      */
     public void responseReady() {
-      // the read buffer is definitely no longer in use, so we will decrement
-      // our read buffer count. we do this here as well as in close because
-      // we'd like to free this read memory up as quickly as possible for other
-      // clients.
-      // readBufferBytesAllocated.addAndGet(-buffer_.array().length);  // TODO
-
       if (!frameTrans_.isWriting()) {
         // go straight to reading again. this was probably an oneway method
         state_ = FrameBufferState.AWAITING_REGISTER_READ;
-        // buffer_ = null;  // TODO
       } else {
-        // writeBuffer_ = ByteBuffer.wrap(response_.get(), 0, response_.len());
-        buffer_.rewind();
+        // the frame transport contains the response bytes to be written
+        // the response may be shorter than the buffer's underlying array
         buffer_.limit(frameTrans_.getBufferPosition());
+        buffer_.rewind();
 
         // set state that we're waiting to be switched to write. we do this
         // asynchronously through requestSelectInterestChange() because there is
@@ -599,7 +596,7 @@ public abstract class AbstractNonblockingServer extends TServer {
 
     protected void resizeBuffer(int bufferBytes) {
       if ((bufferBytes > 0) && (buffer_.capacity() > bufferBytes)) {
-        readBufferBytesAllocated.addAndGet(-buffer_.array().length);
+        readBufferBytesAllocated.addAndGet(-buffer_.capacity());
         buffer_ = VOID_BUFFER;
       } else {
         buffer_.rewind();
