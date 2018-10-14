@@ -23,13 +23,7 @@ import org.apache.thrift.TAsyncProcessor;
 import org.apache.thrift.TByteArrayOutputStream;
 import org.apache.thrift.TException;
 import org.apache.thrift.protocol.TProtocol;
-import org.apache.thrift.transport.TFramedTransport;
-import org.apache.thrift.transport.TIOStreamTransport;
-import org.apache.thrift.transport.TMemoryInputTransport;
-import org.apache.thrift.transport.TNonblockingServerTransport;
-import org.apache.thrift.transport.TNonblockingTransport;
-import org.apache.thrift.transport.TTransport;
-import org.apache.thrift.transport.TTransportException;
+import org.apache.thrift.transport.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -303,15 +297,11 @@ public abstract class AbstractNonblockingServer extends TServer {
 
     protected ByteBuffer frameSizeBuffer_ = ByteBuffer.allocate(4);
 
-    protected ByteBuffer writeBuffer_ = VOID_BUFFER;
-
     // TODO
     protected long callsForResize = 0;
 
-    protected final TByteArrayOutputStream response_;
-
     // the frame that the TTransport should wrap.
-    protected final TMemoryInputTransport frameTrans_;
+    protected final TMemoryTransport frameTrans_;
 
     // the transport that should be used to connect to clients
     protected final TTransport inTrans_;
@@ -335,10 +325,9 @@ public abstract class AbstractNonblockingServer extends TServer {
       selectThread_ = selectThread;
       buffer_ = ByteBuffer.allocate(4);
 
-      frameTrans_ = new TMemoryInputTransport();
-      response_ = new TByteArrayOutputStream();
+      frameTrans_ = new TMemoryTransport();
       inTrans_ = inputTransportFactory_.getTransport(frameTrans_);
-      outTrans_ = outputTransportFactory_.getTransport(new TIOStreamTransport(response_));
+      outTrans_ = outputTransportFactory_.getTransport(frameTrans_);
       inProt_ = inputProtocolFactory_.getProtocol(inTrans_);
       outProt_ = outputProtocolFactory_.getProtocol(outTrans_);
 
@@ -443,7 +432,7 @@ public abstract class AbstractNonblockingServer extends TServer {
     public boolean write() {
       if (state_ == FrameBufferState.WRITING) {
         try {
-          if (trans_.write(writeBuffer_) < 0) {
+          if (trans_.write(buffer_) < 0) {
             return false;
           }
         } catch (IOException e) {
@@ -452,7 +441,7 @@ public abstract class AbstractNonblockingServer extends TServer {
         }
 
         // we're done writing. now we need to switch back to reading.
-        if (writeBuffer_.remaining() == 0) {
+        if (buffer_.remaining() == 0) {
           prepareRead();
         }
         return true;
@@ -519,12 +508,14 @@ public abstract class AbstractNonblockingServer extends TServer {
       // clients.
       // readBufferBytesAllocated.addAndGet(-buffer_.array().length);  // TODO
 
-      if (response_.len() == 0) {
+      if (!frameTrans_.isWriting()) {
         // go straight to reading again. this was probably an oneway method
         state_ = FrameBufferState.AWAITING_REGISTER_READ;
         // buffer_ = null;  // TODO
       } else {
-        writeBuffer_ = ByteBuffer.wrap(response_.get(), 0, response_.len());
+        // writeBuffer_ = ByteBuffer.wrap(response_.get(), 0, response_.len());
+        buffer_.rewind();
+        buffer_.limit(frameTrans_.getBufferPosition());
 
         // set state that we're waiting to be switched to write. we do this
         // asynchronously through requestSelectInterestChange() because there is
@@ -541,7 +532,6 @@ public abstract class AbstractNonblockingServer extends TServer {
      */
     public void invoke() {
       frameTrans_.reset(buffer_.array());
-      response_.reset();
 
       try {
         if (eventHandler_ != null) {
@@ -648,7 +638,6 @@ public abstract class AbstractNonblockingServer extends TServer {
 
     public void invoke() {
       frameTrans_.reset(buffer_.array());
-      response_.reset();
 
       try {
         if (eventHandler_ != null) {
