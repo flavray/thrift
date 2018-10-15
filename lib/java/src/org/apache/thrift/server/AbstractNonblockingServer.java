@@ -19,20 +19,6 @@
 
 package org.apache.thrift.server;
 
-import org.apache.thrift.TAsyncProcessor;
-import org.apache.thrift.TByteArrayOutputStream;
-import org.apache.thrift.TException;
-import org.apache.thrift.protocol.TProtocol;
-import org.apache.thrift.transport.TFramedTransport;
-import org.apache.thrift.transport.TIOStreamTransport;
-import org.apache.thrift.transport.TMemoryInputTransport;
-import org.apache.thrift.transport.TNonblockingServerTransport;
-import org.apache.thrift.transport.TNonblockingTransport;
-import org.apache.thrift.transport.TTransport;
-import org.apache.thrift.transport.TTransportException;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.SelectionKey;
@@ -41,6 +27,17 @@ import java.nio.channels.spi.SelectorProvider;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
+import org.apache.thrift.TAsyncProcessor;
+import org.apache.thrift.TException;
+import org.apache.thrift.protocol.TProtocol;
+import org.apache.thrift.transport.TFramedTransport;
+import org.apache.thrift.transport.TMemoryTransport;
+import org.apache.thrift.transport.TNonblockingServerTransport;
+import org.apache.thrift.transport.TNonblockingTransport;
+import org.apache.thrift.transport.TTransport;
+import org.apache.thrift.transport.TTransportException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Provides common methods and classes used by nonblocking TServer
@@ -51,6 +48,9 @@ public abstract class AbstractNonblockingServer extends TServer {
 
   public static abstract class AbstractNonblockingServerArgs<T extends AbstractNonblockingServerArgs<T>> extends AbstractServerArgs<T> {
     public long maxReadBufferBytes = 256 * 1024 * 1024;
+
+    public int resizeIdleBufferEveryN = 512;
+    public int idleBufferBytes = 1024;
 
     public AbstractNonblockingServerArgs(TNonblockingServerTransport transport) {
       super(transport);
@@ -66,6 +66,19 @@ public abstract class AbstractNonblockingServer extends TServer {
   final long MAX_READ_BUFFER_BYTES;
 
   /**
+   * The number of calls before resizing oversized buffers (0 = only check on close)
+   */
+  final int RESIZE_IDLE_BUFFER_EVERY_N;
+
+  /**
+   * The maximum amount of allocated memory allowed for idle connections buffer.
+   */
+  final int IDLE_BUFFER_BYTES;
+
+  // Reusable empty ByteBuffer
+  protected static final ByteBuffer VOID_BUFFER = ByteBuffer.allocate(0);
+
+  /**
    * How many bytes are currently allocated to read buffers.
    */
   final AtomicLong readBufferBytesAllocated = new AtomicLong(0);
@@ -73,6 +86,8 @@ public abstract class AbstractNonblockingServer extends TServer {
   public AbstractNonblockingServer(AbstractNonblockingServerArgs args) {
     super(args);
     MAX_READ_BUFFER_BYTES = args.maxReadBufferBytes;
+    RESIZE_IDLE_BUFFER_EVERY_N = args.resizeIdleBufferEveryN;
+    IDLE_BUFFER_BYTES = args.idleBufferBytes;
   }
 
   /**
@@ -284,10 +299,14 @@ public abstract class AbstractNonblockingServer extends TServer {
     // the ByteBuffer we'll be using to write and read, depending on the state
     protected ByteBuffer buffer_;
 
-    protected final TByteArrayOutputStream response_;
+    // the ByteBuffer used to read frame sizes
+    protected ByteBuffer frameSizeBuffer_;
+
+    // count the number of times the buffer has been used since its last resize check
+    protected long callsForResize = 0;
 
     // the frame that the TTransport should wrap.
-    protected final TMemoryInputTransport frameTrans_;
+    protected final TMemoryTransport frameTrans_;
 
     // the transport that should be used to connect to clients
     protected final TTransport inTrans_;
@@ -309,12 +328,12 @@ public abstract class AbstractNonblockingServer extends TServer {
       trans_ = trans;
       selectionKey_ = selectionKey;
       selectThread_ = selectThread;
-      buffer_ = ByteBuffer.allocate(4);
+      buffer_ = VOID_BUFFER;
+      frameSizeBuffer_ = ByteBuffer.allocate(4);
 
-      frameTrans_ = new TMemoryInputTransport();
-      response_ = new TByteArrayOutputStream();
+      frameTrans_ = new TMemoryTransport();
       inTrans_ = inputTransportFactory_.getTransport(frameTrans_);
-      outTrans_ = outputTransportFactory_.getTransport(new TIOStreamTransport(response_));
+      outTrans_ = outputTransportFactory_.getTransport(frameTrans_);
       inProt_ = inputProtocolFactory_.getProtocol(inTrans_);
       outProt_ = outputProtocolFactory_.getProtocol(outTrans_);
 
@@ -335,15 +354,15 @@ public abstract class AbstractNonblockingServer extends TServer {
     public boolean read() {
       if (state_ == FrameBufferState.READING_FRAME_SIZE) {
         // try to read the frame size completely
-        if (!internalRead()) {
+        if (!internalRead(frameSizeBuffer_)) {
           return false;
         }
 
         // if the frame size has been read completely, then prepare to read the
         // actual frame.
-        if (buffer_.remaining() == 0) {
+        if (frameSizeBuffer_.remaining() == 0) {
           // pull out the frame size as an integer.
-          int frameSize = buffer_.getInt(0);
+          int frameSize = frameSizeBuffer_.getInt(0);
           if (frameSize <= 0) {
             LOGGER.error("Read an invalid frame size of " + frameSize
                 + ". Are you using TFramedTransport on the client side?");
@@ -358,17 +377,25 @@ public abstract class AbstractNonblockingServer extends TServer {
             return false;
           }
 
-          // if this frame will push us over the memory limit, then return.
-          // with luck, more memory will free up the next time around.
-          if (readBufferBytesAllocated.get() + frameSize > MAX_READ_BUFFER_BYTES) {
-            return true;
+          // reallocate the readbuffer as a frame-sized buffer
+          int neededCapacity = 4 + frameSize;
+          if (neededCapacity > buffer_.capacity()) {
+            int extraCapacity = neededCapacity - buffer_.capacity();
+            // if this frame will push us over the memory limit, then return.
+            // with luck, more memory will free up the next time around.
+            if (readBufferBytesAllocated.get() + extraCapacity > MAX_READ_BUFFER_BYTES) {
+              return true;
+            }
+
+            // increment the amount of memory allocated to read buffers
+            readBufferBytesAllocated.addAndGet(extraCapacity);
+
+            buffer_ = ByteBuffer.allocate(neededCapacity);
+          } else {
+            buffer_.limit(neededCapacity);
+            buffer_.rewind();
           }
 
-          // increment the amount of memory allocated to read buffers
-          readBufferBytesAllocated.addAndGet(frameSize + 4);
-
-          // reallocate the readbuffer as a frame-sized buffer
-          buffer_ = ByteBuffer.allocate(frameSize + 4);
           buffer_.putInt(frameSize);
 
           state_ = FrameBufferState.READING_FRAME;
@@ -481,18 +508,23 @@ public abstract class AbstractNonblockingServer extends TServer {
      * to write and instead go back to reading.
      */
     public void responseReady() {
-      // the read buffer is definitely no longer in use, so we will decrement
-      // our read buffer count. we do this here as well as in close because
-      // we'd like to free this read memory up as quickly as possible for other
-      // clients.
-      readBufferBytesAllocated.addAndGet(-buffer_.array().length);
-
-      if (response_.len() == 0) {
+      if (!frameTrans_.isWriting()) {
         // go straight to reading again. this was probably an oneway method
         state_ = FrameBufferState.AWAITING_REGISTER_READ;
-        buffer_ = null;
       } else {
-        buffer_ = ByteBuffer.wrap(response_.get(), 0, response_.len());
+        // the frame transport contains the response bytes to be written
+        // writing the response may have triggered the transport buffer to grow,
+        // update our internal buffer_ if this is the case.
+        // otherwise limit our internal buffer size to the response size
+        if (buffer_.array() != frameTrans_.getBuffer()) {
+          readBufferBytesAllocated.addAndGet(frameTrans_.getBuffer().length - buffer_.capacity());
+          buffer_ = ByteBuffer.wrap(frameTrans_.getBuffer());
+        } else {
+          buffer_.limit(frameTrans_.getBufferPosition());
+          buffer_.rewind();
+        }
+
+        System.out.println(frameTrans_.getBufferPosition() + " limit " + buffer_.capacity() + " remaining " + frameTrans_.getBytesRemainingInBuffer());
 
         // set state that we're waiting to be switched to write. we do this
         // asynchronously through requestSelectInterestChange() because there is
@@ -509,7 +541,6 @@ public abstract class AbstractNonblockingServer extends TServer {
      */
     public void invoke() {
       frameTrans_.reset(buffer_.array());
-      response_.reset();
 
       try {
         if (eventHandler_ != null) {
@@ -535,8 +566,18 @@ public abstract class AbstractNonblockingServer extends TServer {
      *         connection closed.
      */
     private boolean internalRead() {
+        return internalRead(buffer_);
+    }
+
+    /**
+     * Perform a read into any buffer.
+     *
+     * @return true if the read succeeded, false if there was an error or the
+     *         connection closed.
+     */
+    private boolean internalRead(ByteBuffer buffer) {
       try {
-        if (trans_.read(buffer_) < 0) {
+        if (trans_.read(buffer) < 0) {
           return false;
         }
         return true;
@@ -554,9 +595,24 @@ public abstract class AbstractNonblockingServer extends TServer {
       // we can set our interest directly without using the queue because
       // we're in the select thread.
       selectionKey_.interestOps(SelectionKey.OP_READ);
+      // buffer size housekeeping
+      if (++callsForResize >= RESIZE_IDLE_BUFFER_EVERY_N) {
+        callsForResize = 0;
+        resizeBuffer(IDLE_BUFFER_BYTES);
+      }
       // get ready for another go-around
-      buffer_ = ByteBuffer.allocate(4);
+      frameSizeBuffer_.rewind();
       state_ = FrameBufferState.READING_FRAME_SIZE;
+
+    }
+
+    protected void resizeBuffer(int bufferBytes) {
+      if ((bufferBytes > 0) && (buffer_.capacity() > bufferBytes)) {
+        readBufferBytesAllocated.addAndGet(-buffer_.capacity());
+        buffer_ = VOID_BUFFER;
+      } else {
+        buffer_.rewind();
+      }
     }
 
     /**
@@ -591,7 +647,6 @@ public abstract class AbstractNonblockingServer extends TServer {
 
     public void invoke() {
       frameTrans_.reset(buffer_.array());
-      response_.reset();
 
       try {
         if (eventHandler_ != null) {
