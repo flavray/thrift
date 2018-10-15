@@ -68,7 +68,7 @@ public class TMemoryTransport extends TTransport {
       state_ = State.WRITING;
     }
 
-    ensureCapacity(len);
+    ensureCapacity(pos_ + len);
     System.arraycopy(buf, off, buf_, pos_, len);
     consumeBuffer(len);
   }
@@ -98,7 +98,7 @@ public class TMemoryTransport extends TTransport {
   }
 
   protected void ensureCapacity(int capacity) {
-    if (pos_ + capacity > buf_.length) {
+    if (capacity > buf_.length) {
       grow(capacity);
     }
   }

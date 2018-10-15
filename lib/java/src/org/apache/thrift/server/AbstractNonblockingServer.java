@@ -19,15 +19,7 @@
 
 package org.apache.thrift.server;
 
-import org.apache.thrift.TAsyncProcessor;
-import org.apache.thrift.TException;
-import org.apache.thrift.protocol.TProtocol;
-import org.apache.thrift.transport.*;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import java.io.IOException;
-import java.nio.Buffer;
 import java.nio.ByteBuffer;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
@@ -35,6 +27,17 @@ import java.nio.channels.spi.SelectorProvider;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
+import org.apache.thrift.TAsyncProcessor;
+import org.apache.thrift.TException;
+import org.apache.thrift.protocol.TProtocol;
+import org.apache.thrift.transport.TFramedTransport;
+import org.apache.thrift.transport.TMemoryTransport;
+import org.apache.thrift.transport.TNonblockingServerTransport;
+import org.apache.thrift.transport.TNonblockingTransport;
+import org.apache.thrift.transport.TTransport;
+import org.apache.thrift.transport.TTransportException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Provides common methods and classes used by nonblocking TServer
@@ -510,9 +513,18 @@ public abstract class AbstractNonblockingServer extends TServer {
         state_ = FrameBufferState.AWAITING_REGISTER_READ;
       } else {
         // the frame transport contains the response bytes to be written
-        // the response may be shorter than the buffer's underlying array
-        buffer_.limit(frameTrans_.getBufferPosition());
-        buffer_.rewind();
+        // writing the response may have triggered the transport buffer to grow,
+        // update our internal buffer_ if this is the case.
+        // otherwise limit our internal buffer size to the response size
+        if (buffer_.array() != frameTrans_.getBuffer()) {
+          readBufferBytesAllocated.addAndGet(frameTrans_.getBuffer().length - buffer_.capacity());
+          buffer_ = ByteBuffer.wrap(frameTrans_.getBuffer());
+        } else {
+          buffer_.limit(frameTrans_.getBufferPosition());
+          buffer_.rewind();
+        }
+
+        System.out.println(frameTrans_.getBufferPosition() + " limit " + buffer_.capacity() + " remaining " + frameTrans_.getBytesRemainingInBuffer());
 
         // set state that we're waiting to be switched to write. we do this
         // asynchronously through requestSelectInterestChange() because there is
